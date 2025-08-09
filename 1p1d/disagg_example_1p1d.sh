@@ -26,10 +26,21 @@ export VLLM_HOST_IP=$(hostname -I | awk '{print $1}')
 # a function that waits vLLM server to start
 wait_for_server() {
   local port=$1
-  timeout 1200 bash -c "
-    until curl -s localhost:${port}/v1/completions > /dev/null; do
-      sleep 1
-    done" && return 0 || return 1
+  local api_key=${OPENAI_API_KEY}  # Use environment variable
+
+  if [ -n "$api_key" ]; then
+    # Use API key if environment variable is set
+    timeout 1200 bash -c "
+      until curl -s -H 'Authorization: Bearer ${api_key}' localhost:${port}/v1/models > /dev/null; do
+        sleep 1
+      done" && return 0 || return 1
+  else
+    # No API key if environment variable is not set
+    timeout 1200 bash -c "
+      until curl -s localhost:${port}/v1/models > /dev/null; do
+        sleep 1
+      done" && return 0 || return 1
+  fi
 }
 
 export VLLM_NIXL_SIDE_CHANNEL_HOST=127.0.0.1

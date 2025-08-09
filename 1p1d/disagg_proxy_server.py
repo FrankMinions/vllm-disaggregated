@@ -44,39 +44,63 @@ class SchedulingPolicy(ABC):
 
 class Proxy:
     def __init__(
-        self,
-        prefill_instances: list[str],
-        decode_instances: list[str],
-        model: str,
-        scheduling_policy: SchedulingPolicy,
-        custom_create_completion: Optional[
-            Callable[[Request], StreamingResponse]
-        ] = None,
-        custom_create_chat_completion: Optional[
-            Callable[[Request], StreamingResponse]
-        ] = None,
+            self,
+            prefill_instances: list[str],
+            decode_instances: list[str],
+            model: str,
+            scheduling_policy: SchedulingPolicy,
+            custom_create_completion: Optional[
+                Callable[[Request], StreamingResponse]
+            ] = None,
+            custom_create_chat_completion: Optional[
+                Callable[[Request], StreamingResponse]
+            ] = None,
     ):
         self.prefill_instances = prefill_instances
         self.decode_instances = decode_instances
         self.prefill_cycler = itertools.cycle(prefill_instances)
         self.decode_cycler = itertools.cycle(decode_instances)
         self.model = model
+        self.api_key = os.environ.get('OPENAI_API_KEY')
         self.scheduling_policy = scheduling_policy
         self.custom_create_completion = custom_create_completion
         self.custom_create_chat_completion = custom_create_chat_completion
         self.router = APIRouter()
         self.setup_routes()
 
+    def client_api_key_authenticate(self, authorization: str = Header(None)):
+        """Authenticate client requests using OPENAI_API_KEY"""
+        if not authorization:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized",
+            )
+
+        if not authorization.startswith("Bearer "):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized",
+            )
+
+        provided_key = authorization[7:]  # Remove "Bearer " prefix
+        if provided_key != self.api_key:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized",
+            )
+
     def setup_routes(self):
         self.router.post(
-            "/v1/completions", dependencies=[Depends(self.validate_json_request)]
+            "/v1/completions",
+            dependencies=[Depends(self.validate_json_request), Depends(self.client_api_key_authenticate)]
         )(
             self.custom_create_completion
             if self.custom_create_completion
             else self.create_completion
         )
         self.router.post(
-            "/v1/chat/completions", dependencies=[Depends(self.validate_json_request)]
+            "/v1/chat/completions",
+            dependencies=[Depends(self.validate_json_request), Depends(self.client_api_key_authenticate)]
         )(
             self.custom_create_chat_completion
             if self.custom_create_chat_completion
@@ -115,7 +139,7 @@ class Proxy:
         try:
             async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as client:
                 logger.info("Verifying %s ...", instance)
-                async with client.get(url) as response:
+                async with client.get(url, headers={"Authorization": f"Bearer {self.api_key}"}) as response:
                     if response.status == 200:
                         data = await response.json()
                         if "data" in data and len(data["data"]) > 0:
@@ -198,15 +222,15 @@ class Proxy:
 
     async def forward_request(self, url, data, use_chunked=True):
         async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
-            headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+            headers = {"Authorization": f"Bearer {self.api_key}"}
             try:
                 async with session.post(
-                    url=url, json=data, headers=headers
+                        url=url, json=data, headers=headers
                 ) as response:
                     if 200 <= response.status < 300 or 400 <= response.status < 500:  # noqa: E501
                         if use_chunked:
                             async for chunk_bytes in response.content.iter_chunked(  # noqa: E501
-                                1024
+                                    1024
                             ):
                                 yield chunk_bytes
                         else:
@@ -226,7 +250,7 @@ class Proxy:
                         raise HTTPException(
                             status_code=response.status,
                             detail=f"Request failed with status {response.status}: "
-                            f"{error_content}",
+                                   f"{error_content}",
                         )
             except aiohttp.ClientError as e:
                 logger.error("ClientError occurred: %s", str(e))
@@ -300,7 +324,7 @@ class Proxy:
             prefill_instance = self.schedule(self.prefill_cycler)
             try:
                 async for _ in self.forward_request(
-                    f"http://{prefill_instance}/v1/chat/completions", kv_prepare_request
+                        f"http://{prefill_instance}/v1/chat/completions", kv_prepare_request
                 ):
                     continue
             except HTTPException as http_exc:
@@ -346,11 +370,11 @@ class RoundRobinSchedulingPolicy(SchedulingPolicy):
 
 class ProxyServer:
     def __init__(
-        self,
-        args: argparse.Namespace,
-        scheduling_policy: Optional[SchedulingPolicy] = None,
-        create_completion: Optional[Callable[[Request], StreamingResponse]] = None,
-        create_chat_completion: Optional[Callable[[Request], StreamingResponse]] = None,
+            self,
+            args: argparse.Namespace,
+            scheduling_policy: Optional[SchedulingPolicy] = None,
+            create_completion: Optional[Callable[[Request], StreamingResponse]] = None,
+            create_chat_completion: Optional[Callable[[Request], StreamingResponse]] = None,
     ):
         self.validate_parsed_serve_args(args)
         self.port = args.port
@@ -393,9 +417,11 @@ class ProxyServer:
 
     def verify_model_config(self, instances: list, model: str) -> None:
         model_suffix = model.split("/")[-1]
+        api_key = os.environ.get('OPENAI_API_KEY')
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
         for instance in instances:
             try:
-                response = requests.get(f"http://{instance}/v1/models")
+                response = requests.get(f"http://{instance}/v1/models", headers=headers)
                 if response.status_code == 200:
                     model_cur = response.json()["data"][0]["id"]
                     model_cur_suffix = model_cur.split("/")[-1]
