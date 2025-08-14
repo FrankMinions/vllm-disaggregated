@@ -1,6 +1,7 @@
 import itertools
 from abc import ABC, abstractmethod
 
+
 class SchedulingPolicy(ABC):
     """Abstract base class for scheduling policies"""
     

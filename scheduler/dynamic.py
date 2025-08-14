@@ -1,10 +1,12 @@
 import logging
 import itertools
 import threading
+import numpy as np
 from typing import Dict, List
 from base import SchedulingPolicy
 
 logger = logging.getLogger(__name__)
+
 
 class DynamicPrioritySchedulingPolicy(SchedulingPolicy):
     """
@@ -15,13 +17,15 @@ class DynamicPrioritySchedulingPolicy(SchedulingPolicy):
     - O(1) scheduling complexity
     """
     
-    def __init__(self, max_active_requests_per_instance: int = 3):
+    def __init__(self, max_active_requests_per_instance: int = 3, stats_max_count: int = 100000):
         self.max_active_requests_per_instance = max_active_requests_per_instance
+        self.stats_max_count = stats_max_count
         self.instance_active_requests = {}  # instance -> active request count
         self.instance_performance_history = {}  # instance -> list of recent response times
-        self.request_length_stats = {'min': float('inf'), 'max': 0, 'count': 0, 'sum': 0}
+        self.request_length_stats = {'count': 0, 'sum': 0}
+        self.request_length_list = []
         self._lock = threading.Lock()
-        logger.info(f"Initialized intelligent priority scheduling: max_active_per_instance={max_active_requests_per_instance}")
+        logger.info(f"Initialized intelligent priority scheduling: max_active_per_instance={max_active_requests_per_instance}, stats_max_count={stats_max_count}")
     
     def _get_instance_load(self, instance: str) -> int:
         """Get current active request count for an instance"""
@@ -37,34 +41,34 @@ class DynamicPrioritySchedulingPolicy(SchedulingPolicy):
     def _update_request_length_stats(self, sequence_length: int):
         """Update global request length statistics for dynamic threshold calculation"""
         with self._lock:
-            self.request_length_stats['min'] = min(self.request_length_stats['min'], sequence_length)
-            self.request_length_stats['max'] = max(self.request_length_stats['max'], sequence_length)
+            # Check if we need to reset stats
+            if len(self.request_length_list) >= self.stats_max_count:
+                logger.info(f"Stats count reached limit {self.stats_max_count}, resetting statistics")
+                self.request_length_stats = {'count': 0, 'sum': 0}
+                self.request_length_list.clear()
+
+            # Update stats with new entry
             self.request_length_stats['count'] += 1
             self.request_length_stats['sum'] += sequence_length
+            self.request_length_list.append(sequence_length)
     
     def _calculate_dynamic_threshold(self) -> float:
-        """Calculate dynamic threshold based on observed request lengths"""
-        stats = self.request_length_stats
-        if stats['count'] < 10:  # Need enough samples
+        """Calculate dynamic threshold based on observed request lengths using 75th percentile"""
+        if len(self.request_length_list) < 10:  # Need enough samples
             return 100  # Default threshold
-        
-        # Use 25th percentile as threshold (requests shorter than this are considered "short")
-        # For simplicity, use mean - 0.5 * std as approximation
-        mean = stats['sum'] / stats['count']
-        # Simple approximation of variance
-        variance = (stats['max'] - stats['min']) ** 2 / 4
-        std = variance ** 0.5
-        threshold = max(mean - 0.5 * std, stats['min'])
-        
-        return threshold
+
+        # Calculate 75th percentile using numpy
+        threshold = np.percentile(self.request_length_list, 75)
+
+        return float(threshold)
     
     def _calculate_instance_score(self, instance: str, sequence_length: int) -> float:
         """Calculate instance score for request assignment (lower is better)"""
         current_load = self._get_instance_load(instance)
-        
+
         # Load factor (0-1, lower is better)
         load_factor = current_load / self.max_active_requests_per_instance
-        
+
         # Performance factor based on recent history
         if instance in self.instance_performance_history and self.instance_performance_history[instance]:
             recent_times = self.instance_performance_history[instance][-10:]  # Last 10 responses
@@ -72,20 +76,24 @@ class DynamicPrioritySchedulingPolicy(SchedulingPolicy):
             performance_factor = min(avg_response_time / 2.0, 1.0)  # Normalize to 0-1
         else:
             performance_factor = 0.5  # Default neutral score
-        
+
         # Length factor (prefer shorter requests for better instances)
-        # Normalize sequence length to 0-1 range
-        stats = self.request_length_stats
-        if stats['max'] > stats['min']:
-            length_factor = (sequence_length - stats['min']) / (stats['max'] - stats['min'])
+        # Use percentile-based normalization
+        if len(self.request_length_list) >= 10:
+            # Calculate the percentile of current sequence length relative to historical data
+            # Convert to numpy array for efficient calculation
+            lengths_array = np.array(self.request_length_list)
+            # Count how many values are less than or equal to current sequence length
+            count_below = np.sum(lengths_array <= sequence_length)
+            length_factor = count_below / len(lengths_array)  # 0-1, lower is better for shorter requests
         else:
-            length_factor = 0.5
-        
+            length_factor = 0.5  # Default neutral score
+
         # Combined score with weights
         score = load_factor * 0.5 + performance_factor * 0.3 + length_factor * 0.2
-        
+
         return score
-    
+
     def _get_available_instances(self, cycler: itertools.cycle) -> List[str]:
         """Get list of available instances from cycler efficiently"""
         instances = []
@@ -114,42 +122,44 @@ class DynamicPrioritySchedulingPolicy(SchedulingPolicy):
         """
         if sequence_length is None:
             return next(cycler)  # Fallback to round-robin
-        
+
         # Update request length statistics
         self._update_request_length_stats(sequence_length)
-        
+
         with self._lock:
             # Get available instances
             available_instances = self._get_available_instances(cycler)
-            
+
             if not available_instances:
                 return next(cycler)  # Fallback to round-robin
-            
+
             # Filter non-overloaded instances
-            non_overloaded = [inst for inst in available_instances 
-                            if self._get_instance_load(inst) < self.max_active_requests_per_instance]
-            
+            non_overloaded = [inst for inst in available_instances
+                              if self._get_instance_load(inst) < self.max_active_requests_per_instance]
+
             if not non_overloaded:
                 # All instances are overloaded, use round-robin
                 logger.debug(f"All instances overloaded, using round-robin for request with length {sequence_length}")
                 return next(cycler)
-            
+
             # Calculate dynamic threshold
             dynamic_threshold = self._calculate_dynamic_threshold()
-            
+
             # For requests below dynamic threshold, use intelligent selection
             if sequence_length <= dynamic_threshold:
                 # Find best instance based on load and performance
-                best_instance = min(non_overloaded, 
-                                  key=lambda x: self._calculate_instance_score(x, sequence_length))
-                logger.debug(f"Priority scheduling: short request (length={sequence_length}, threshold={dynamic_threshold:.1f}) assigned to {best_instance}")
+                best_instance = min(non_overloaded,
+                                    key=lambda x: self._calculate_instance_score(x, sequence_length))
+                logger.info(
+                    f"Priority scheduling: short request (length={sequence_length}, threshold={dynamic_threshold:.1f}) assigned to {best_instance}")
                 return best_instance
             else:
                 # For longer requests, use simple round-robin among available instances
                 # Use a deterministic selection based on current state
                 selected_idx = sequence_length % len(non_overloaded)
                 selected_instance = non_overloaded[selected_idx]
-                logger.debug(f"Standard scheduling: long request (length={sequence_length}, threshold={dynamic_threshold:.1f}) assigned to {selected_instance}")
+                logger.info(
+                    f"Standard scheduling: long request (length={sequence_length}, threshold={dynamic_threshold:.1f}) assigned to {selected_instance}")
                 return selected_instance
     
     def update_request_status(self, request_id: str, status: str, assigned_instance: str = None):
@@ -189,6 +199,9 @@ class DynamicPrioritySchedulingPolicy(SchedulingPolicy):
                 'total_instances': len(self.instance_active_requests),
                 'request_length_stats': self.request_length_stats.copy(),
                 'dynamic_threshold': dynamic_threshold,
-                'instance_performance': {k: len(v) for k, v in self.instance_performance_history.items()}
+                'instance_performance': {k: len(v) for k, v in self.instance_performance_history.items()},
+                'stats_max_count': self.stats_max_count,
+                'current_stats_count': self.request_length_stats['count'],
+                'request_length_list_size': len(self.request_length_list)
             }
         

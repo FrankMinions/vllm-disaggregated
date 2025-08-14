@@ -7,6 +7,7 @@ from base import SchedulingPolicy
 
 logger = logging.getLogger(__name__)
 
+
 class AdaptiveBucketingSchedulingPolicy(SchedulingPolicy):
     """
     Adaptive bucketing scheduling policy with optimized load balancing
@@ -42,7 +43,7 @@ class AdaptiveBucketingSchedulingPolicy(SchedulingPolicy):
         new_load = max(0, current_load + delta)
         self.instance_active_requests[instance] = new_load
         logger.debug(f"Instance {instance} load updated: {current_load} -> {new_load}")
-    
+
     def _get_shortest_pending_request(self, bucket) -> Optional[tuple]:
         """
         Get the shortest pending request from a bucket for priority scheduling
